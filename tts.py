@@ -1,13 +1,18 @@
+import atexit
+import base64
+from contextlib import redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import importlib
 import importlib.util
 import io
+import json
 import os
 import re
+import select
 import subprocess
 import sys
-import tempfile
+import threading
 import wave
 from pathlib import Path
 
@@ -16,6 +21,91 @@ import numpy as np
 from main import clean
 
 _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
+_process_lock = threading.Lock()
+_speech_process = None
+
+
+class SpeechWorkerError(RuntimeError):
+    pass
+
+
+def _read_response(process, timeout: int) -> dict:
+    if process.stdout is None or not select.select([process.stdout], [], [], timeout)[0]:
+        raise TimeoutError("Seslendirme worker'ı zaman aşımına uğradı.")
+    line = process.stdout.readline()
+    if not line:
+        raise RuntimeError(
+            f"Seslendirme worker'ı beklenmedik şekilde kapandı (kod {process.poll()})."
+        )
+    try:
+        response = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SpeechWorkerError("Seslendirme worker'ından geçersiz yanıt alındı.") from exc
+    if "error" in response:
+        raise SpeechWorkerError(response["error"])
+    return response
+
+
+def _start_speech_process():
+    global _speech_process
+    _speech_process = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        env={
+            **os.environ,
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+        },
+    )
+    try:
+        _read_response(_speech_process, timeout=1800)
+    except Exception:
+        _stop_speech_process()
+        raise
+
+
+def _stop_speech_process():
+    global _speech_process
+    process, _speech_process = _speech_process, None
+    if process is None:
+        return
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def _persistent_speech(answer: str) -> bytes:
+    global _speech_process
+    with _process_lock:
+        if _speech_process is None or _speech_process.poll() is not None:
+            _start_speech_process()
+        process = _speech_process
+        try:
+            if process.stdin is None:
+                raise RuntimeError("Seslendirme worker'ının giriş kanalı açılamadı.")
+            process.stdin.write(json.dumps({"text": answer}, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            response = _read_response(process, timeout=1800)
+            return base64.b64decode(response["audio"], validate=True)
+        except (BrokenPipeError, OSError, RuntimeError, KeyError, ValueError) as exc:
+            if not isinstance(exc, SpeechWorkerError) or process.poll() is not None:
+                _stop_speech_process()
+            raise
+
+
+atexit.register(_stop_speech_process)
 
 
 @lru_cache(maxsize=1)
@@ -43,29 +133,7 @@ def load_model():
 
 
 def request_speech(answer: str):
-    # One worker prevents simultaneous installs and serializes model initialization.
-    return _worker.submit(_isolated_speech, answer)
-
-
-def _isolated_speech(answer: str) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="tourism-tts-") as directory:
-        output = Path(directory) / "speech.wav"
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), str(output)],
-            input=answer, capture_output=True, text=True, timeout=1800,
-            env={
-                **os.environ,
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-                "OPENBLAS_NUM_THREADS": "1",
-            },
-        )
-        if result.returncode:
-            raise RuntimeError(
-                f"Seslendirme süreci durdu (kod {result.returncode}):\n"
-                + (result.stderr or result.stdout)[-6000:]
-            )
-        return output.read_bytes()
+    return _worker.submit(_persistent_speech, answer)
 
 
 def spoken_text(answer: str) -> str:
@@ -100,11 +168,11 @@ def spoken_text(answer: str) -> str:
     return text.strip(" ,;")
 
 
-def synthesize(answer: str) -> bytes:
+def synthesize(answer: str, model=None) -> bytes:
     text = spoken_text(answer)
     if not text:
         raise ValueError("Seslendirilecek metin bulunamadı.")
-    speech = load_model().say(text)
+    speech = (model or load_model()).say(text)
     audio = np.asarray(speech.audio, dtype=np.float32)
     if audio.ndim != 1 or not audio.size or not np.isfinite(audio).all():
         raise ValueError("TTS modeli geçerli bir ses üretmedi.")
@@ -118,5 +186,25 @@ def synthesize(answer: str) -> bytes:
     return output.getvalue()
 
 
+def _run_worker() -> int:
+    try:
+        with redirect_stdout(sys.stderr):
+            model = load_model()
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), flush=True)
+        return 1
+    print(json.dumps({"ready": True}), flush=True)
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            with redirect_stdout(sys.stderr):
+                audio = synthesize(request["text"], model=model)
+            response = {"audio": base64.b64encode(audio).decode("ascii")}
+        except Exception as exc:
+            response = {"error": str(exc)}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+    return 0
+
+
 if __name__ == "__main__":
-    Path(sys.argv[1]).write_bytes(synthesize(sys.stdin.read()))
+    raise SystemExit(_run_worker())

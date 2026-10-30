@@ -33,6 +33,13 @@ def format_result(result, debug):
         return lines[0]
     if result["plan"]:
         lines.append("\nCalisan uzmanlar: " + " -> ".join(result["plan"]))
+    for event in result.get("tools", []):
+        lines.append(
+            "\nCalistirilan arac: " + event["name"]
+            + "\nQwen function call: " + str(event.get("requested_by_model"))
+            + "\nGirdiler: " + str(event["arguments"])
+            + "\nSonuc: " + str(event["result"])
+        )
     sources = result.get("sources", [])
     if sources:
         lines.append("\nGetirilen kaynaklar (tamami cevapta kullanilmis olmayabilir):")

@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage
 import streamlit as st
 
 from agents import create_graph
-from config import MAX_INPUT, MODEL
+from config import MAX_INPUT, MODEL, TOOL_MODEL
 from main import clean
 from rag import Retriever
 
@@ -42,8 +42,8 @@ def show_audio(message, index):
     if task is not None:
         if not task.done():
             st.info(
-                "Ses hazırlanıyor… İlk kullanımda paketler kurulup model indirilir. "
-                "Bu sırada sohbet etmeye devam edebilirsiniz."
+                "Ses hazırlanıyor… İlk istekte paket kurulumu ve modelin yüklenmesi uzun sürebilir. "
+                "Sonraki seslendirmeler aynı worker'ı kullanır. Bu sırada sohbet etmeye devam edebilirsiniz."
             )
         else:
             try:
@@ -56,9 +56,10 @@ def show_audio(message, index):
     if "speech_error" in message:
         st.error("Seslendirme başarısız; yeniden deneyebilirsiniz: " + message["speech_error"])
     if "audio" in message:
+        autoplay = message.pop("autoplay", False)
         st.audio(
             message["audio"], format="audio/wav",
-            autoplay=message.get("autoplay", False),
+            autoplay=autoplay,
         )
         st.caption("Bu ses yapay zekâ ile üretilmiştir.")
 
@@ -75,6 +76,15 @@ def show_answer(message, index):
                     page = f"s. {source['page']}" if source["page"] else "HTML"
                     st.write(f"[K{number}] {source['title']} · {page}")
                     st.write(source["url"])
+            if result["tools"]:
+                st.caption("Çalıştırılan araçlar")
+                for event in result["tools"]:
+                    st.write(event["name"])
+                    st.json({
+                        "Qwen function call": event.get("requested_by_model"),
+                        "Girdiler": event["arguments"],
+                        "Sonuç": event["result"],
+                    })
     if not st.session_state.tts_enabled:
         return
     show_audio(message, index)
@@ -89,8 +99,8 @@ with st.sidebar:
         st.caption("EMA Lightning · Türkçe · Apache-2.0")
         st.caption(
             "Yeni yanıtlar otomatik seslendirilir. İlk sesli yanıtta gerekli paketler kurulur, "
-            "model indirilir (yaklaşık 34 MB; paketler ayrıca yer kaplar). "
-            "Metin cihazda işlenir."
+            "model indirilir (yaklaşık 34 MB; paketler ayrıca yer kaplar). Model, uygulama "
+            "açık kaldığı sürece tekrar kullanılır. Metin cihazda işlenir."
         )
         st.caption("Kurulum arka planda yapılır. TTS'yi kapatmak başlamış işi iptal etmez.")
     st.divider()
@@ -99,6 +109,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
     st.caption(f"Yerel model: {MODEL}")
+    st.caption(f"Function-calling modeli: {TOOL_MODEL}")
     st.caption("Konuşmalar yalnızca bu tarayıcı oturumunda tutulur.")
 
 st.title("Turizm Asistanı")
@@ -119,6 +130,8 @@ for index, message in enumerate(st.session_state.messages):
 
 question = st.chat_input("Sorunuzu yazın…", max_chars=MAX_INPUT)
 if question and question.strip():
+    for previous_message in st.session_state.messages:
+        previous_message.pop("autoplay", None)
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -140,6 +153,7 @@ if question and question.strip():
                         {key: source[key] for key in ("title", "url", "page")}
                         for source in result["sources"]
                     ],
+                    "tools": result["tools"],
                 },
             })
             if st.session_state.tts_enabled:

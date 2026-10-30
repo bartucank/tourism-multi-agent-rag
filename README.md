@@ -22,10 +22,10 @@ are supplied to an existing model as context. This is retrieval-augmented
 generation (RAG). Adding documents requires rebuilding the index, not retraining
 Gemma.
 
-There are no function calls selected by the model, MCP connections, bank/PMS
-integrations, payment operations, support applications or verified financial
-calculators. Business information comes from the user's messages, not external
-hotel systems.
+The finance specialist can select one model tool: a deterministic fixed-rate
+loan installment calculator. It does not connect to banks, PMS systems or live
+data, submit support applications, or approve credit. Business information
+comes from the user's messages, not external hotel systems.
 
 ### 2. Quick start
 
@@ -43,6 +43,7 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ollama pull gemma3:4b
+ollama pull qwen2.5:3b
 ollama pull qwen3-embedding:0.6b
 
 # Required first-time data download and corpus selection:
@@ -96,13 +97,23 @@ ollama pull registry.ollama.com/library/qwen3-embedding:0.6b
 ollama cp registry.ollama.com/library/qwen3-embedding:0.6b qwen3-embedding:0.6b
 ```
 
+If pulling the tool model also fails with a TLS handshake error, try the
+alternate official registry and create the expected local tag:
+
+```bash
+ollama pull registry.ollama.com/library/qwen2.5:3b
+ollama cp registry.ollama.com/library/qwen2.5:3b qwen2.5:3b
+```
+
 ### 3. Models, dependencies and design choices
 
 | Component | Choice | Why it is used |
 |---|---|---|
 | Answer generation | `gemma3:4b` through Ollama | Local Turkish-language answers; one model serves different prompted specialist roles |
+| Function-call selection | `qwen2.5:3b` through Ollama | Separate tool-capable model; Gemma 3 does not support Ollama tool calls |
 | Embeddings | `qwen3-embedding:0.6b` through Ollama | Converts documents and questions into comparable vectors |
 | Orchestration | LangGraph | Explicit routing, specialist order, shared state and conversation checkpoints |
+| Calculator implementation | LangChain tool | Validates inputs and deterministically calculates fixed-rate monthly installments |
 | Vector index | FAISS `IndexFlatIP` | Simple local similarity search without a database service |
 | Chat UI | Streamlit | Python-native chat, session state, debug controls and audio playback |
 | HTTP collection | Requests | Bounded downloads, timeouts and explicit request failures |
@@ -291,7 +302,8 @@ Question and conversation history
   -> Supervisor
   -> Retrieval
   -> Selected specialists, in order
-  -> Synthesis
+       -> Finance: optional Qwen tool call -> deterministic calculator
+  -> Synthesis (skipped after calculation to preserve exact results)
   -> Answer
 ```
 
@@ -303,7 +315,7 @@ requesting both a greeting-only answer and specialist execution.
 | Specialist | Responsibility | Boundary |
 |---|---|---|
 | Regulation/support (`mevzuat`) | Explain tax, support, guarantees and regulatory conditions from retrieved excerpts | Do not invent eligibility conditions or unsupported legal details |
-| Finance (`finans`) | Discuss financing options, cash-flow risk and missing inputs qualitatively | Do not claim verified calculations or credit approval |
+| Finance (`finans`) | Discuss financing and cash-flow risk; call the installment calculator when all inputs are supplied | Do not invent missing inputs or imply credit approval |
 | Operations (`isletme`) | Discuss occupancy, sales channels, commissions and hotel/agency operations | Do not invent bookings, revenue or internal operating data |
 
 Specialists run **sequentially**, not in parallel, and receive the same retrieved
@@ -311,6 +323,27 @@ excerpts. For one specialist, its answer is used directly. For several, another
 model call synthesizes their answers. Greetings use a fixed reply without
 retrieval. Conversation windows are bounded in prompts; the complete conversation
 is not sent to every model call.
+
+When a calculator tool ran, specialist outputs are combined without another
+model synthesis call so computed amounts are preserved exactly.
+
+An explicit loan calculation request is routed directly to the finance
+specialist. Qwen normally selects the `calculate_loan_payment` function tool;
+if it omits the call or returns arguments that differ from the user's message,
+the app still runs the same deterministic tool with only the explicitly parsed
+user inputs. Debug mode shows whether Qwen selected the call. If an input is
+missing, the assistant asks for it instead of guessing. The calculator assumes
+a fixed nominal rate divided by 12 and equal end-of-month payments; fees, taxes,
+insurance and variable rates are excluded. The result is an illustrative
+calculation, not a bank offer, eligibility decision or credit approval. Debug
+mode shows the tool name, inputs and output. The interest rate is entered by the user as a scenario assumption;
+the application does not fetch current bank rates. In a real deployment, this
+tool could be extended to retrieve current rates and product terms through
+authorized bank APIs or integrations, where available, and show each source and
+retrieval time. `gemma3:4b` handles answers and routing; `qwen2.5:3b` is the
+separate tool-capable model used only by the finance specialist to select this
+calculator. It requires an additional model download. No other external actions
+or MCP tools are available.
 
 The default answer model uses temperature 0, an 8192 context setting and an output
 budget of 900 tokens. Routing uses a smaller context/output budget. These are
@@ -325,14 +358,26 @@ It is not a complete citation parser for arbitrary model-generated notation.
 
 Normal mode hides citation labels and extra diagnostics from the displayed
 answer. Debug mode exposes the specialist sequence and retrieved sources,
-including page/HTML references and URLs. Retrieved sources may include chunks
-that were not actually used in the final answer.
+including page/HTML references and URLs, as well as calculator calls and their
+inputs/results. Retrieved sources may include chunks that were not actually
+used in the final answer.
 
 ### 9. Chat UI and memory
 
 `ui.py` provides chat bubbles, a question input, **New chat**, **Debug mode** and
 the optional **Seslendirme (TTS)** switch. The Deploy button is hidden with a
 targeted style rule; this does not alter Streamlit's hosting behavior.
+
+#### Screenshots
+
+Greeting and a verified finance calculator response from the Streamlit interface:
+
+![Greeting in the Streamlit chat](docs/screenshots/greeting.png)
+
+![Loan calculator response in the Streamlit chat](docs/screenshots/loan-tool.png)
+
+The earlier KOSGEB answer capture is omitted because it displayed an inaccurate
+expansion of the institution's name.
 
 Each Streamlit session owns its graph, in-memory checkpoint store, message list
 and generated audio. Sessions do not intentionally share conversations.
@@ -353,9 +398,9 @@ When enabled, **new** assistant answers automatically enter the speech queue.
 Existing answers are not retroactively synthesized. The first spoken answer:
 
 1. Runs a speech job on a background worker so the UI remains usable.
-2. Starts a separate Python process using the application's Python interpreter.
+2. Starts one isolated Python worker using the application's Python interpreter.
 3. If missing, installs `ema-lightning==1.1.2` and its dependencies through pip.
-4. Loads EMA and downloads its model weights, approximately 34 MB, into the
+4. Loads EMA and downloads its model weights once (approximately 34 MB) into the
    Hugging Face cache. PyTorch and other packages require additional disk space.
 5. Generates speech locally, returns a mono 48 kHz WAV to the UI and plays it.
 
@@ -364,12 +409,14 @@ Enabling the switch alone installs nothing. Initial installation/downloads need
 internet access, pip and a writable Python environment. No answer text is sent
 to a remote speech synthesis API.
 
-Jobs are serialized by one worker. Each request loads the model in an isolated
-process while reusing installed packages and downloaded weights. Isolation costs
-startup time but prevents a native TTS crash from killing the chat. The worker
-sets CPU thread counts to one because multithreaded execution caused native
-crashes on the development machine. CUDA is selected by EMA when available;
-otherwise it uses CPU. CUDA compilation is not explicitly enabled by this app.
+Jobs are serialized by one worker. The isolated process loads the model once and
+reuses it for later answers while the app is running; a browser refresh does not
+start another download. After restarting the app, the weights are reused from
+the Hugging Face disk cache. Keeping TTS in a separate process prevents a native
+TTS crash from killing the chat. The worker sets CPU thread counts to one
+because multithreaded execution caused native crashes on the development
+machine. CUDA is selected by EMA when available; otherwise it uses CPU. CUDA
+compilation is not explicitly enabled by this app.
 
 Before synthesis, a speech-only text cleanup removes code blocks, image links,
 URLs, source labels such as `[K1]`/`K1`, Markdown formatting, list numbering and
@@ -394,6 +441,7 @@ applicable attribution/NOTICE information. Dependencies have their own licenses.
 | Setting | Default | Effect |
 |---|---|---|
 | `OLLAMA_MODEL` | `gemma3:4b` | Routing, specialist and synthesis model |
+| `OLLAMA_TOOL_MODEL` | `qwen2.5:3b` | Finance function-calling model |
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Document/query vectors; rebuild the index after changing it |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
 
@@ -412,7 +460,8 @@ pointing it to a remote server sends prompts/embedding inputs to that server.
 | `data/corpus.json`, `data/excluded.json` | Active selection and excluded candidate list |
 | `rag.py`, `build_index.py` | Text splitting, embedding, index creation and retrieval |
 | `vector_db/` | Generated index, chunks and index metadata |
-| `agents.py` | Supervisor, specialists, synthesis and citation validation |
+| `agents.py` | Supervisor, specialists, synthesis, calculator tool calling and citation validation |
+| `loan_tools.py` | Validated fixed-rate monthly loan installment calculator |
 | `main.py` | Terminal chat and shared answer formatting |
 | `ui.py` | Streamlit chat, session state, debug and automatic speech controls |
 | `tts.py` | Lazy package installation, speech text preparation and isolated synthesis |
@@ -468,9 +517,10 @@ metin parçalarına dönüştürülür. Soruyla ilgili parçalar hazır modele b
 olarak verilir. Bu yaklaşım RAG'dir. Yeni belge eklemek Gemma'yı eğitmeyi değil,
 arama indeksini yeniden oluşturmayı gerektirir.
 
-Modelin seçtiği function calling, MCP, banka/PMS bağlantısı, ödeme işlemi,
-destek başvurusu veya doğrulanmış finansal hesaplama aracı yoktur. İşletme
-bilgileri kullanıcının mesajlarından gelir; otel sistemlerinden çekilmez.
+Finans uzmanı, gerekli girdiler mevcut olduğunda sabit faizli kredi taksitini
+hesaplayan deterministik bir function calling aracını seçebilir. Banka/PMS
+bağlantısı, canlı veri, ödeme işlemi, destek başvurusu veya kredi onayı yoktur.
+İşletme bilgileri kullanıcının mesajlarından gelir; otel sistemlerinden çekilmez.
 
 ### 2. Kurulum ve çalıştırma
 
@@ -488,6 +538,7 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ollama pull gemma3:4b
+ollama pull qwen2.5:3b
 ollama pull qwen3-embedding:0.6b
 
 # Zorunlu ilk kurulum: belgeleri indir ve korpusu sec:
@@ -540,13 +591,23 @@ ollama pull registry.ollama.com/library/qwen3-embedding:0.6b
 ollama cp registry.ollama.com/library/qwen3-embedding:0.6b qwen3-embedding:0.6b
 ```
 
+Tool modeli indirilirken de TLS el sıkışma hatası alınırsa alternatif resmî
+registry adresini ve yerel modeli beklenen kısa adla kullanın:
+
+```bash
+ollama pull registry.ollama.com/library/qwen2.5:3b
+ollama cp registry.ollama.com/library/qwen2.5:3b qwen2.5:3b
+```
+
 ### 3. Teknolojiler ve neden seçildikleri
 
 | Bileşen | Seçim | Kullanım nedeni |
 |---|---|---|
 | Cevap üretimi | Ollama üzerinden `gemma3:4b` | Yerel Türkçe yanıt; farklı uzman talimatlarıyla aynı modelin kullanılması |
+| Function-call seçimi | Ollama üzerinden `qwen2.5:3b` | Gemma 3 tool call desteklemediğinden, finans aracını seçen ayrı model |
 | Embedding | Ollama üzerinden `qwen3-embedding:0.6b` | Belgeleri ve soruları karşılaştırılabilir vektörlere dönüştürmek |
 | Orkestrasyon | LangGraph | Açık yönlendirme, uzman sırası, ortak state ve konuşma hafızası |
+| Hesaplama aracı | LangChain tool | Girdileri doğrulayıp sabit faizli aylık taksiti deterministik hesaplamak |
 | Vektör indeksi | FAISS `IndexFlatIP` | Ayrı veritabanı servisi gerektirmeyen yerel benzerlik araması |
 | Arayüz | Streamlit | Python ile chat, oturum yönetimi, debug ve ses oynatma |
 | İndirme | Requests | Boyut/zaman sınırları olan HTTP istekleri |
@@ -733,7 +794,8 @@ Soru ve konuşma geçmişi
   -> Supervisor
   -> Belge arama
   -> Seçilen uzmanlar, sırayla
-  -> Birleştirme
+       -> Finans: isteğe bağlı Qwen tool call -> deterministik hesaplayıcı
+  -> Birleştirme (hesaplama sonrası sonucu korumak için atlanır)
   -> Cevap
 ```
 
@@ -744,7 +806,7 @@ yalnız selamlama hem uzman çalıştırma gibi çelişkili kararları önlemek 
 | Uzman | Görev | Sınır |
 |---|---|---|
 | Mevzuat/destek (`mevzuat`) | Vergi, destek, kefalet ve mevzuat koşullarını getirilen metinle açıklamak | Belgesiz koşul ve uygunluk iddiası üretmemek |
-| Finans (`finans`) | Finansman, nakit akışı riski ve eksik girdileri nitel değerlendirmek | Doğrulanmış hesap veya kredi onayı iddia etmemek |
+| Finans (`finans`) | Finansman ve nakit akışı riskini değerlendirmek; tüm girdiler varsa taksit aracını çağırmak | Eksik girdileri uydurmamak veya kredi onayı iddia etmemek |
 | İşletme (`isletme`) | Doluluk, satış kanalları, komisyon ve operasyonu değerlendirmek | Rezervasyon, gelir ve işletme verisi uydurmamak |
 
 Uzmanlar **paralel değil sırayla** çalışır; aynı getirilen alıntıları görürler.
@@ -752,6 +814,27 @@ Tek uzman varsa yanıtı doğrudan kullanılır; birden fazlaysa başka bir mode
 çağrısıyla birleştirilir. Selamlama sabit yanıt alır, belge aramaz.
 Prompt'larda geçmişin sınırlı pencereleri kullanılır; her çağrıya bütün konuşma
 aktarılmaz.
+
+Hesaplama aracı çalıştıysa, yeni bir model sentezi yapılmadan uzman yanıtları
+birleştirilir; böylece hesaplanan tutarlar değiştirilmeden korunur.
+
+Kredi taksiti hesaplama isteği doğrudan finans uzmanına yönlendirilir. Qwen
+normalde `calculate_loan_payment` function aracını seçer. Çağrı üretmezse veya
+girdileri kullanıcının yazdıklarından farklıysa uygulama, aynı deterministik
+aracı yalnızca kullanıcı mesajından açıkça ayrıştırdığı değerlerle çalıştırır.
+Debug modunda Qwen'in aracı seçip seçmediği görünür. Bir girdi eksikse tahmin
+yerine kullanıcıdan istenir. Hesaplama sabit nominal faizin 12'ye bölündüğünü
+ve ay sonlarında eşit taksit ödendiğini varsayar; vergi, ücret, sigorta ve
+değişken faiz dahil değildir. Sonuç örnek hesaplamadır; banka teklifi, kredi
+uygunluk kararı veya onay değildir. Faiz oranını kullanıcı senaryo varsayımı
+olarak girer; uygulama güncel banka faizlerini çekmez. Gerçek kullanımda, erişilebilir
+olması halinde bankaların yetkili API veya entegrasyonlarından güncel oran ve
+ürün koşulları alınarak araç geliştirilebilir; her oranla birlikte kaynağı ve
+alınma zamanı gösterilmelidir. `gemma3:4b` cevap/yönlendirme için; `qwen2.5:3b`
+ise yalnızca bu function call'ı seçmek için kullanılır. İkinci model ilk kurulumda
+ayrıca indirilir. Örnek: “10.000.000 TL kredi, yıllık %36 faiz ve 60 ay
+vade varsayımıyla aylık taksiti hesapla.” Debug modunda araç adı, girdiler ve
+sonuç görülür. Başka harici işlem veya MCP aracı yoktur.
 
 Varsayılan cevap modelinde temperature 0, 8192 bağlam ayarı ve 900 token çıktı
 bütçesi vardır. Yönlendiricide daha küçük bağlam/çıktı bütçesi kullanılır.
@@ -766,14 +849,19 @@ desteklendiğini kanıtlamaz**. Modelin üretebileceği her farklı atıf yazım
 çözümleyen tam bir atıf ayrıştırıcısı değildir.
 
 Normal modda kaynak etiketleri ve ek tanılama bilgileri görünmez. Debug modunda
-uzman sırası, getirilen kaynaklar, sayfa/HTML bilgisi ve URL'ler gösterilir.
-Getirilen her parça son cevapta kullanılmış olmak zorunda değildir.
+uzman sırası, getirilen kaynaklar, sayfa/HTML bilgisi, URL'ler ve hesaplama
+aracının çağrısı, girdileri ve sonucu gösterilir. Getirilen her parça son
+cevapta kullanılmış olmak zorunda değildir.
 
 ### 9. Chat arayüzü ve hafıza
 
 `ui.py`; mesaj balonları, soru alanı, **Yeni sohbet**, **Debug modu** ve
 **Seslendirme (TTS)** seçeneğini sunar. Deploy butonu hedefli bir stil kuralıyla
 gizlenir; bu değişiklik Streamlit'in yayınlama davranışını değiştirmez.
+
+İngilizce bölümde selamlama ve doğrulanmış kredi hesaplama/function-call
+örneklerinin ekran görüntüleri bulunur. Önceki KOSGEB cevabı ekran görüntüsü,
+kurum adının yanlış açılımını içerdiği için README'de gösterilmez.
 
 Her Streamlit oturumu kendi graph'ını, bellek içi checkpoint deposunu, mesajlarını
 ve seslerini tutar. Konuşmalar oturumlar arasında bilerek paylaşılmaz.
@@ -794,9 +882,9 @@ Açıldığında **yeni** cevaplar otomatik ses kuyruğuna alınır. Geçmiş ce
 geriye dönük seslendirilmez. İlk sesli cevapta:
 
 1. Arayüzü bekletmemek için arka plan worker'ı işi başlatır.
-2. Uygulamanın Python yorumlayıcısıyla ayrı bir Python süreci açılır.
+2. Uygulamanın Python yorumlayıcısıyla tek bir izole Python worker'ı açılır.
 3. Paket yoksa pip ile `ema-lightning==1.1.2` ve bağımlılıkları kurulur.
-4. EMA yüklenir; yaklaşık 34 MB ağırlık Hugging Face önbelleğine indirilir.
+4. EMA yüklenir; yaklaşık 34 MB ağırlık Hugging Face önbelleğine bir kez indirilir.
    PyTorch ve diğer paketler ayrıca disk alanı kullanır.
 5. Yerelde ses üretilir; mono 48 kHz WAV arayüze döner ve oynatılır.
 
@@ -804,11 +892,13 @@ Ayrı requirements dosyası veya elle TTS kurulumu gerekmez. Seçeneği açmak t
 başına kurulum başlatmaz. İlk kurulum/indirme internet, pip ve yazılabilir Python
 ortamı gerektirir. Cevap metni uzak bir seslendirme API'sine gönderilmez.
 
-İşler tek worker ile sıraya alınır. Her istekte ayrı süreçte model belleğe
-yüklenir; kurulu paketler ve indirilmiş ağırlıklar tekrar kullanılır. Süreç
-izolasyonu başlangıç maliyeti getirir ancak yerel kütüphanedeki bir çöküşün
-chat'i kapatmasını önler. Geliştirme makinesinde çok iş parçacıklı çalıştırmada
-yerel çökmeler yaşandığından CPU thread sayıları bire ayarlanmıştır.
+İşler tek worker ile sıraya alınır. İzole süreç modeli bir kez belleğe alır ve
+uygulama açık kaldığı sürece yeni cevaplarda tekrar kullanır; tarayıcıyı
+yenilemek yeni bir indirme başlatmaz. Uygulama yeniden başlatıldığında ağırlıklar
+Hugging Face disk önbelleğinden kullanılır. Süreç izolasyonu, yerel TTS
+kütüphanesindeki bir çöküşün chat'i kapatmasını önler. Geliştirme makinesinde çok
+iş parçacıklı çalıştırmada yerel çökmeler yaşandığından CPU thread sayıları bire
+ayarlanmıştır.
 EMA varsa CUDA, yoksa CPU seçer; uygulama CUDA derleme modunu ayrıca açmaz.
 
 Ses öncesi ayrı metin temizliği; kod blokları, görsel bağlantıları, URL'ler,
@@ -834,6 +924,7 @@ korunmalıdır. Bağımlılıkların kendi lisansları vardır.
 | Ayar | Varsayılan | Etki |
 |---|---|---|
 | `OLLAMA_MODEL` | `gemma3:4b` | Yönlendirme, uzman ve birleştirme modeli |
+| `OLLAMA_TOOL_MODEL` | `qwen2.5:3b` | Finans function-calling modeli |
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Belge/soru vektörleri; değişince indeks yenilenmelidir |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama adresi |
 
@@ -853,6 +944,7 @@ uzak adres seçilirse prompt ve embedding girdileri o sunucuya gönderilir.
 | `rag.py`, `build_index.py` | Chunking, embedding, indeksleme ve arama |
 | `vector_db/` | Üretilen indeks, parçalar ve indeks bilgileri |
 | `agents.py` | Supervisor, uzmanlar, birleştirme ve atıf kontrolü |
+| `loan_tools.py` | Doğrulamalı, sabit faizli aylık kredi taksiti hesaplayıcısı |
 | `main.py` | Terminal sohbeti ve ortak yanıt biçimlendirme |
 | `ui.py` | Streamlit chat, oturum, debug ve otomatik ses kontrolleri |
 | `tts.py` | Gecikmeli paket kurulumu, ses metni hazırlama ve izole üretim |
