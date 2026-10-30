@@ -859,9 +859,16 @@ cevapta kullanılmış olmak zorunda değildir.
 **Seslendirme (TTS)** seçeneğini sunar. Deploy butonu hedefli bir stil kuralıyla
 gizlenir; bu değişiklik Streamlit'in yayınlama davranışını değiştirmez.
 
-İngilizce bölümde selamlama ve doğrulanmış kredi hesaplama/function-call
-örneklerinin ekran görüntüleri bulunur. Önceki KOSGEB cevabı ekran görüntüsü,
-kurum adının yanlış açılımını içerdiği için README'de gösterilmez.
+#### Ekran görüntüleri
+
+Streamlit arayüzünden selamlama ve doğrulanmış kredi hesaplama örnekleri:
+
+![Streamlit sohbetinde selamlama](docs/screenshots/greeting.png)
+
+![Streamlit sohbetinde kredi hesaplama yanıtı](docs/screenshots/loan-tool.png)
+
+Önceki KOSGEB cevabı ekran görüntüsü, kurum adının yanlış açılımını içerdiği
+için README'de gösterilmez.
 
 Her Streamlit oturumu kendi graph'ını, bellek içi checkpoint deposunu, mesajlarını
 ve seslerini tutar. Konuşmalar oturumlar arasında bilerek paylaşılmaz.
